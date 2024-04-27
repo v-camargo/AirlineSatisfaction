@@ -1,0 +1,446 @@
+---
+title: "Predição da satisfação dos passageiros de companhias aéreas"
+date: "25/06/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Objetivo
+
+O Objetivo deste trabalho é estudar os perfis e respostas de pesquisas de satisfação de passageiros de companhias aéreas para propor modelos que consigam predizer se um passageiro estará satisfeito com um voo.
+
+
+### Importando Bibliotecas
+
+```{r, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(GGally)
+library(ggplot2)
+library(ggrepel)
+library(factoextra)
+library(skimr)
+library(plotly)
+library(cluster)
+library(janitor)
+library(rsample)
+library(yardstick)
+library(caret)
+library(ggpubr)
+library(keras) 
+library(Matrix)
+library(tidymodels)
+theme_set(theme_pubr())
+
+```
+
+
+## Análise Exploratória
+
+Realizou-se uma primeira contagem das variáveis da base de dados e percebeu-se que há um maior número de passageiros fiéis e viagens de negócio.
+Não há distinção no número de homens e mulheres e a classe Business é a mais utilizada.
+
+
+```{r}
+bdzero <- read.csv("airline.csv")
+
+bdzero[ ,c('X')] <- list(NULL)
+
+
+genero <- ggplot(bdzero, aes(Gender), ) + geom_bar() + xlab("Gênero") + ylab("Contagem")
+
+tipo_cliente <- ggplot(bdzero, aes(Customer.Type)) + geom_bar() + xlab("Tipo de Cliente") + ylab("Contagem")
+
+tipo_viagem <- ggplot(bdzero, aes(Type.of.Travel)) + geom_bar() + xlab("Tipo de Viagem") + ylab("Contagem")
+
+classe <- ggplot(bdzero, aes(Class)) + geom_bar() + xlab("Classe") + ylab("Contagem")
+
+
+figure <- ggarrange(genero, tipo_cliente, tipo_viagem, classe,
+                    ncol = 2, nrow = 2) 
+skim(bdzero)
+
+figure
+
+```
+
+### Construção do PCA
+
+Para entender melhor quais fatores influenciam na satisfação do passageiro, foi feito um PCA (Principal Component Analysis): técnica para reduzir as dimensões de um conjunto de variáveis através da criação de novas variáveis não correlacionadas que objetivam abarcar a maior variância da amostra.
+Retirou-se, então, algumas colunas que não serão utilizadas no PCA.  
+
+
+```{r}
+
+
+bd1 <- read.csv("airline.csv")
+
+
+bd1[ ,c('X', 'Customer.Type','Gender','id','Age','Type.of.Travel',
+        'Class','Flight.Distance','satisfaction',"Departure.Delay.in.Minutes",
+        "Arrival.Delay.in.Minutes")] <- list(NULL)
+
+bd1[is.na(bd1)] <- 0
+
+set.seed(1234)
+X <- bd1
+pca <- prcomp(X)
+pca$rotation <- -pca$rotation
+pca$x <- -pca$x
+Phi <- pca$rotation
+Z <- pca$x
+fviz_eig(pca, addlabels = TRUE)
+
+```
+
+
+Percebe-se que três dimensões explicam carca de 60% dos dados, logo foi realizada a diminuição das dimensões do dataframe inicial para somente três dimensões (drivers) e cada uma foi nomeada a partir da análise das contribuições das questões para cada driver.
+
+#### 1º Driver:  CONFORTO
+
+```{r, message=FALSE, warning=FALSE}
+
+pca %>% 
+  fviz_contrib(choice = "var", axes = 1, sort.val = "asc", top = 10,
+               fill = "steelblue", color = "black") +
+  labs(x = "", title = "Contribuições das questões para o primeiro driver") +
+  coord_flip()
+
+```
+
+#### 2º Driver: EMBARQUE
+
+```{r, message=FALSE, warning=FALSE}
+
+pca %>% 
+  fviz_contrib(choice = "var", axes = 2, sort.val = "asc", top = 10,
+               fill = "steelblue", color = "black") +
+  labs(x = "", title = "Contribuições das questões para o segundo driver") +
+  coord_flip()
+
+```
+
+#### 3º Driver: ATENDIMENTO
+
+```{r, message=FALSE, warning=FALSE}
+
+pca %>% 
+  fviz_contrib(choice = "var", axes = 3, sort.val = "asc", top = 10,
+               fill = "steelblue", color = "black") +
+  labs(x = "", title = "Contribuições das questões para o terceiro driver") +
+  coord_flip()
+
+```
+
+Através do PCA, percebe-se que as características mais valorizadas pelos passageiros são conforto, facilidade no embarque e qualidade do atendimento.
+
+### Clusterização
+
+Para melhor entendimento dos passageiros que frequentam as companhias aéreas, foi feito uma clusterização utilizando **k-means** e **método do joelho**
+
+
+## Preparação inicial dos dados
+
+A nova base **bd2** contém os valores de *z* para as predições
+
+```{r}
+bd2 <- bdzero
+
+bd2$conforto <- Z[,1]
+
+bd2$embarque <- Z[,2]
+
+bd2$atendimento <- Z[,3]
+
+bd2$satisfaction [bd2$satisfaction == "neutral or dissatisfied"] <- 1
+bd2$satisfaction [bd2$satisfaction == "satisfied"] <- 0
+bd2$satisfaction <- as.integer(bd2$satisfaction)
+
+bd2$id <- NULL
+
+
+```
+
+
+## K-Means
+
+Foi feito o **One-Hot-Encoding** e **Scale** das variáveis antes de aplicar o k-means
+
+```{r, message=FALSE, warning=FALSE}
+
+#one-hot-encoding
+
+dmy <- dummyVars(" ~ .", data = bd2)
+bd3 <- data.frame(predict(dmy, newdata = bd2))
+
+#Scaling
+bd3_scaled <- bd3
+
+bd3_scaled[is.na(bd3_scaled)] <- 0
+
+bd3_scaled <- bd3_scaled %>% 
+  scale()  
+
+bd3_scaled <- as.data.frame(bd3_scaled)
+
+
+```
+
+Para se escolher a quantidade de clusters, utilizou-se o **Método do Joelho** e discussões acerca da natureza do negócio analisado
+
+```{r message=FALSE, warning=FALSE}
+
+set.seed(123)
+
+tibble(k = 2:30) %>% 
+  mutate(w = map_dbl(k, ~ kmeans(bd3_scaled, centers = .x)$tot.withinss)) %>% 
+  ggplot(aes(k, w)) + 
+  geom_point() + 
+  geom_line()
+
+```
+
+Segundo o Método do Joelho, 9 clusters seriam uma boa escolha, porém, ao analisar comparativamente a média das variáveis de cada um dos 9 clusters e discutir sobre a natureza do negócio, decidiu-se utilizar somente 5 clusters para apoio no estudo e interpretação do problema apresnetado
+
+
+## Montagem dos Clusters
+```{r}
+set.seed(123)
+descricao <- bd3_scaled %>% 
+    mutate(cluster = factor(kmeans(bd3_scaled, centers = 5)$cluster))
+
+set.seed(123)
+descricao9 <- bd3_scaled %>% 
+    mutate(cluster9 = factor(kmeans(bd3_scaled, centers = 9)$cluster))
+
+
+```
+
+###  Tabela comparativa com as médias de cada variável em cada um dos clusters
+```{r}
+
+bd2$cluster <- descricao[,32]
+bd2$cluster <- descricao[,32]
+
+bd4 <- bd2
+bd4_9 <- bd2
+bd4_9$cluster9 <- descricao9[,32]
+
+bd4[7:20] <- NULL 
+bd4_9[7:20] <- NULL
+
+bd4[is.na(bd4)] <- 0
+bd4_9[is.na(bd4_9)] <- 0
+
+bd4$satisfaction <- as.factor(bd4$satisfaction)
+bd4_9$satisfaction <- as.factor(bd4_9$satisfaction)
+
+tabela1 <- bd4 %>%  
+  group_by(cluster) %>% 
+  summarise(across(where(is.numeric), mean))
+
+
+
+tabela1
+
+
+tabela9 <- bd4_9 %>%  
+  group_by(cluster9) %>% 
+  summarise(across(where(is.numeric), mean))
+
+
+tabela9
+
+
+```
+
+
+Para finalizar a análise exploratória dos dados, percebeu-se queo cluster 4 contém a maioria dos clientes satisfeitos, sendo o único cluster com mais clientes satisfeitos do que insatisfeitos.
+
+```{r}
+
+p<- ggplot(bd4) + 
+  stat_count(mapping = aes(x = satisfaction, y = ..count../tapply(..count.., ..x.. , sum)[..x..], 
+                          fill=satisfaction),
+             position = position_dodge2(preserve = "single")) + 
+  facet_grid(.~ cluster) + xlab("Satisfação") +ylab("Proporção")
+
+p<-p+ scale_fill_manual(values = c("springgreen2", "tomato1"), labels = c("Satisfeito", "Não satisfeito"))
+
+ p+ theme(
+  axis.text.x=element_blank(),
+  axis.ticks.x=element_blank()
+)
+
+```
+
+
+## Modelagem
+
+### Regressão Logística e Rede Neural
+
+Os modelos escolhidos para a análise foram a Regressão Logística e a Rede Neural. 
+Decidiu-se utilizar somente as componentes calculadas pelo PCA, as variáveis dummies e a variável resposta nos modelos, com o objetvo de predizer se o passageiro estará satisfeito com o voo.
+
+
+### Seprando dos dados em treino e teste 
+Foi escolhida a separção dos dados em 70% treino e 30% teste.
+Os dados foram normalizados e criou-se as variáveis dummies com o pacote [recipe].
+
+```{r message=FALSE, warning=FALSE, echo = FALSE}
+bd5 <- bd4
+
+bd5$Age <- NULL 
+bd5$Flight.Distance <- NULL
+bd5$Departure.Delay.in.Minutes <- NULL
+bd5$Arrival.Delay.in.Minutes <- NULL
+
+
+split2 <- initial_split(bd5, prop = 0.7, strata = "satisfaction")
+
+treinamento2 <- training(split2)
+teste2 <- testing(split2)
+
+
+
+treinamento2 %>% str
+
+receita2 <- recipe(satisfaction ~ ., treinamento2) %>% 
+  step_normalize(all_numeric()) %>% 
+  step_dummy(Gender, Customer.Type, Type.of.Travel, Class)
+
+
+receita_prep2 <- prep(receita2) 
+
+treinamento_proc2 <- bake(receita_prep2, new_data = NULL) 
+
+teste_proc2 <- bake(receita_prep2, new_data = teste2)
+
+
+
+```
+
+
+### Regressão Logística
+
+```{r}
+fit_glm2 <- logistic_reg() %>% 
+  set_engine("glm") %>% 
+  set_mode("classification") %>% 
+  fit(satisfaction ~ ., treinamento_proc2) 
+
+tidy(fit_glm2)
+
+fitted2 <- fit_glm2 %>% 
+  predict(new_data = teste_proc2, type = "prob") %>% 
+  mutate(observado = teste_proc2$satisfaction, 
+         modelo = "logistica") 
+
+
+```
+
+### Rede Neural 
+
+Para utilizar a rede neural, retirou-se a variável resposta e os clusters do dataset e as dummies foram tranformadas em One-Hot-Encoding
+
+```{r}
+
+treinamento_proc_net <-  treinamento_proc2 %>% dplyr::select(-c(satisfaction, cluster))
+teste_proc_net <- teste_proc2 %>% dplyr::select(-c(satisfaction, cluster))
+
+dmy2 <- dummyVars("~.", data = treinamento_proc_net)
+treino_ohe_bd5 <- data.frame(predict(dmy2, newdata = treinamento_proc2)) 
+
+dmy3 <- dummyVars("~.", data = teste_proc_net)
+teste_ohe_bd5 <- data.frame(predict(dmy3, newdata = teste_proc_net))
+
+
+treino_net <- treino_ohe_bd5 %>% as.matrix()
+teste_net <- teste_ohe_bd5 %>% as.matrix()
+
+```
+
+#### Configuração da Rede Neural
+
+Utilizou-se uma rede de três camadas com as funções de ativação [relu] e [softmax].
+
+```{r message=FALSE, warning=FALSE}
+
+treino_respost <-to_categorical(treinamento_proc2$satisfaction, num_classes = 2)
+teste_respost <- to_categorical(teste_proc2$satisfaction, num_classes = 2)
+
+model <- keras_model_sequential() %>%
+  layer_dense(units = 64, 
+              activation = "relu",
+              input_shape = c(ncol(treino_net))) %>%
+  layer_dense(units = 64, 
+              activation = "relu") %>%
+  layer_dense(units = ncol(treino_respost), 
+              activation = "softmax")
+
+```
+
+#### Compile da Rede Neural
+
+A Rede Neural utilizou uma função de otmização [rmsprop], uma função de perda [binary_crossentropy] e a métrica monitorada foi [accuracy]
+
+
+```{r message=FALSE, warning=FALSE}
+
+net <- compile(model, optimizer = "rmsprop", 
+                      loss = "binary_crossentropy",
+                      metrics = "accuracy")
+
+
+history <- fit(net, treino_net, as.matrix(treino_respost), 
+               epochs = 10,
+               batch_size = 128,
+               validation_data = list(teste_net, teste_respost))
+
+plot(history)
+
+```
+
+### Aplicação da Rede Neural
+
+O modelo foi aplicado na base de testes para se quantificar a performance e comparar com a Regressão Logística
+
+```{r message=FALSE, warning=FALSE}
+net_pred <- net %>% predict(teste_net) %>% `>`(0.5) %>% k_cast("int32") %>%  k_get_value()
+rede_resposta <- data.frame(pred=net_pred, 
+           observado=teste_proc2$satisfaction)
+
+rede_resposta <- rede_resposta %>% rename(.pred_0 =pred.1 , .pred_1 = pred.2 )
+
+fitted3 <-  rede_resposta  %>% 
+  mutate(modelo = "rede neural") %>% as.tibble()
+
+```
+
+
+## Avaliação dos Modelos
+
+Como a base de dados é bem balanceada, decidiu-se utilizar a curva ROC como métrica de desempenho dos modelos
+
+```{r}
+
+avaliacao <- bind_rows(fitted2, fitted3)
+
+avaliacao %>% 
+  group_by(modelo) %>% 
+  roc_curve(observado, .pred_0) %>% autoplot()
+
+
+avaliacao %>% 
+  group_by(modelo) %>% 
+  roc_auc(observado, .pred_0)
+
+```
+## Conclusão
+
+Opta-se pela regressão logística para predizer a satisfação dos passageiros.
+A regressão logística, modelo mais simples, performou melhor que a rede neural para predizer a variável resposta.
+Conforme encontra-se empíricamente e através da consulta à literatura, para problemas mais simples e com poucas variáveis, a regressão logística tende a ter melhor resultado; como aqui foi exposto.
+A rede neural tende a se sair melhor em problemas mais complexos, como, por exemplo, classificação de imagem; além disso, por ser um modelo mais complexo, não é a melhor escolha para abordar o problema trabalhado aqui neste material. 
